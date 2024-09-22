@@ -5,17 +5,15 @@
 #include "quatro.hpp"
 #include "imageProjection.hpp"
 #include "patchwork.hpp"
+#include "CSF_filter.h"  // add CSF
+#include <thread>
+#include <future>
 
 namespace fs = std::experimental::filesystem;
 
 boost::shared_ptr<PatchWork<PointType> > patchwork;
 
 pcl::PointCloud<PointType>::ConstPtr getCloud(std::string filename);
-
-void setParams(
-        double noise_bound_of_each_measurement, double square_of_the_ratio_btw_noise_and_noise_bound,
-        double estimating_scale, int num_max_iter, double control_parameter_for_gnc,
-        double rot_cost_thr, const string& reg_type_name, Quatro<PointType, PointType>::Params &params);
 
 std::string lidarType;
 std::string groundSegMode;
@@ -28,6 +26,39 @@ const int numWidth      = 8;
 string dashedLine = std::string(nameWidth + numWidth * 2 + 7, '-');
 
 using namespace std;
+
+void setParams(
+        double noise_bound_of_each_measurement, double square_of_the_ratio_btw_noise_and_noise_bound,
+        double estimating_scale, int num_max_iter, double control_parameter_for_gnc,
+        double rot_cost_thr, const string& reg_type_name, Quatro<PointType, PointType>::Params &params);
+
+void applyCSFFilterAsync(const pcl::PointCloud<PointType>::Ptr& cloud_in,
+                         pcl::PointCloud<PointType>& ground_out,
+                         pcl::PointCloud<PointType>::Ptr& non_ground_out,
+                         const CSFParams& params) {
+    applyCSFFilter(cloud_in, ground_out, non_ground_out, params);
+}
+
+void processImageProjection(const std::string& lidarType, const std::string& neighborSelectionMode, const std::string& groundSegMode,
+                            const pcl::PointCloud<PointType>::Ptr& rawCloud, pcl::PointCloud<PointType>& groundCloud, 
+                            pcl::PointCloud<PointType>::Ptr& nonGroundCloud, pcl::PointCloud<PointType>::Ptr& validSegments, 
+                            pcl::PointCloud<PointType>& invalidSegments) {
+    ImageProjection IP(lidarType, neighborSelectionMode, groundSegMode);
+    IP.segmentCloud(rawCloud);
+    IP.getGround(groundCloud);
+    IP.getValidSegments(*validSegments);
+    IP.getOutliers(invalidSegments);
+}
+
+void processPatchwork(ros::NodeHandle& nh, const pcl::PointCloud<PointType>::Ptr& rawCloud, pcl::PointCloud<PointType>& groundCloud, 
+                      pcl::PointCloud<PointType>::Ptr& nonGroundCloud, pcl::PointCloud<PointType>::Ptr& validSegments, 
+                      pcl::PointCloud<PointType>& invalidSegments) {
+    patchwork.reset(new PatchWork<PointType>(&nh));
+    double t;
+    patchwork->estimate_ground(*rawCloud, groundCloud, *nonGroundCloud, t);
+    processImageProjection(lidarType, neighborSelectionMode, "Patchwork", nonGroundCloud, groundCloud, nonGroundCloud, validSegments, invalidSegments);
+}
+
 
 int main(int argc, char **argv) {
     ros::init(argc, argv, "run_example");
@@ -55,9 +86,23 @@ int main(int argc, char **argv) {
     nh.param<double>("/Quatro/rotation/rot_cost_diff_thr", rot_cost_diff_thr, 0.0001);
     nh.param<int>("/Quatro/rotation/num_max_iter", num_max_iter, 50);
 
+    // std::cout << "num_max_iter: " << num_max_iter << std::endl;
+
     nh.param<std::string>("/Lidar_type", lidarType, "Velodyne-64-HDE");
     nh.param<std::string>("/ground_segmentation_mode", groundSegMode, "Patchwork");
     nh.param<std::string>("/neigbor_mode", neighborSelectionMode, "4CrossNeighbor");
+
+    // CSF parameters
+    CSFParams csf_params;
+    nh.param<bool>("/CSF/bSloopSmooth", csf_params.bSloopSmooth, false);
+    nh.param<double>("/CSF/cloth_resolution", csf_params.cloth_resolution, 1.5);
+    nh.param<double>("/CSF/rigidness", csf_params.rigidness, 3.0);
+    nh.param<double>("/CSF/time_step", csf_params.time_step, 0.9);
+    nh.param<double>("/CSF/class_threshold", csf_params.class_threshold, 0.5);
+    nh.param<int>("/CSF/iterations", csf_params.iterations, 400);
+
+    // std::cout << "iteration: " << csf_params.iterations << std::endl;
+
 
     ros::Publisher SrcPublisher   = nh.advertise<sensor_msgs::PointCloud2>("/source", 100);
     ros::Publisher TgtPublisher   = nh.advertise<sensor_msgs::PointCloud2>("/target", 100);
@@ -118,51 +163,37 @@ int main(int argc, char **argv) {
     pcl::PointCloud<PointType>::Ptr ptrSrcNonground(new pcl::PointCloud<PointType>);
     pcl::PointCloud<PointType>::Ptr ptrTgtNonground(new pcl::PointCloud<PointType>);
 
-
     pcl::PointCloud<PointType> srcInvalidSegments;
     pcl::PointCloud<PointType> tgtInvalidSegments;
     pcl::PointCloud<PointType>::Ptr srcValidSegments(new pcl::PointCloud<PointType>);
     pcl::PointCloud<PointType>::Ptr tgtValidSegments(new pcl::PointCloud<PointType>);
 
-    ImageProjection IPSrc(lidarType, neighborSelectionMode, groundSegMode);
-    ImageProjection IPTgt(lidarType, neighborSelectionMode, groundSegMode);
-
     std::chrono::system_clock::time_point start = std::chrono::system_clock::now();
     if (groundSegMode == "LeGO-LOAM") {
         std::cout << "Ground Segmentation Mode: LeGO-LOAM" << std::endl;
-        IPSrc.segmentCloud(srcRaw);
-        IPTgt.segmentCloud(tgtRaw);
-
-        IPSrc.getGround(srcGround);
-        IPTgt.getGround(tgtGround);
+        processImageProjection(lidarType, neighborSelectionMode, groundSegMode, srcRaw, srcGround, ptrSrcNonground, srcValidSegments, srcInvalidSegments);
+        processImageProjection(lidarType, neighborSelectionMode, groundSegMode, tgtRaw, tgtGround, ptrTgtNonground, tgtValidSegments, tgtInvalidSegments);
 
     } else if (groundSegMode == "Patchwork") {
         std::cout << "Ground Segmentation Mode: Patchwork" << std::endl;
-        /***
-         * STEP 2. Preprocessing by extracting non-ground points
-         * for speeding up the STEP 3 (feature extraction & matching),
-         * redundant points, i.e. ground or bushes, are rejected
-         */
-        patchwork.reset(new PatchWork<PointType>(&nh));
-        patchwork->estimate_ground(*(srcRaw), srcGround, *ptrSrcNonground, tSrc);
-        patchwork->estimate_ground(*(tgtRaw), tgtGround, *ptrTgtNonground, tTgt);
+        processPatchwork(nh, srcRaw, srcGround, ptrSrcNonground, srcValidSegments, srcInvalidSegments);
+        processPatchwork(nh, tgtRaw, tgtGround, ptrTgtNonground, tgtValidSegments, tgtInvalidSegments);
 
-        /***
-         * STEP 3. Extract valid segment points by using image projection
-         * This process outputs valid segments by image projection,
-         * i.e. `srcValidSegments` and `tgtValidSegments`.
-         * Next, feature extraction takes these valid segments as input.
-         * The original code of image projection is from LeGO-LOAM:
-         * https://github.com/RobustFieldAutonomyLab/LeGO-LOAM
-         */
-        IPSrc.segmentCloud(ptrSrcNonground);
-        IPTgt.segmentCloud(ptrTgtNonground);
+    } else if (groundSegMode == "CSF") {
+        std::cout << "Ground Segmentation Mode: CSF" << std::endl;
+        
+        applyCSFFilterAsync(srcRaw, srcGround, ptrSrcNonground, csf_params);
+        applyCSFFilterAsync(tgtRaw, tgtGround, ptrTgtNonground, csf_params);
+
+        // // 异步调用CSF滤除操作
+        // auto srcFuture = std::async(std::launch::async, applyCSFFilterAsync, srcRaw, std::ref(srcGround), std::ref(ptrSrcNonground), csf_params);
+        // auto tgtFuture = std::async(std::launch::async, applyCSFFilterAsync, tgtRaw, std::ref(tgtGround), std::ref(ptrTgtNonground), csf_params);
+        // // 等待异步任务完成
+        // srcFuture.get();
+        // tgtFuture.get();
     }
-    IPSrc.getValidSegments(*srcValidSegments);
-    IPTgt.getValidSegments(*tgtValidSegments);
 
-    IPSrc.getOutliers(srcInvalidSegments);
-    IPTgt.getOutliers(tgtInvalidSegments);
+    std::chrono::system_clock::time_point after_ground = std::chrono::system_clock::now();
 
     /* --------------------------------------------------------------------- */
     /***
@@ -178,21 +209,21 @@ int main(int argc, char **argv) {
     cout << right << setw(numWidth) << setfill(separator) << srcGround.size() << " | ";
     cout << right << setw(numWidth) << setfill(separator) << tgtGround.size() << endl;
 
-    if (groundSegMode == "Patchwork") {
-        cout << left  << setw(nameWidth) << setfill(separator) << "# of nonground" << " | ";
-        cout << right << setw(numWidth) << setfill(separator) << ptrSrcNonground->points.size() << " | ";
-        cout << right << setw(numWidth) << setfill(separator) << ptrTgtNonground->points.size() << endl;
+    cout << left  << setw(nameWidth) << setfill(separator) << "# of nonground" << " | ";
+    cout << right << setw(numWidth) << setfill(separator) << ptrSrcNonground->points.size() << " | ";
+    cout << right << setw(numWidth) << setfill(separator) << ptrTgtNonground->points.size() << endl;
+
+    if (groundSegMode == "Patchwork" || groundSegMode == "LeGO-LOAM") {
+        cout << dashedLine << endl;
+        cout << left  << setw(nameWidth) << setfill(separator) << "# of valid segments" << " | ";
+        cout << right << setw(numWidth) << setfill(separator) << srcValidSegments->points.size() << " | ";
+        cout << right << setw(numWidth) << setfill(separator) << tgtValidSegments->points.size() << endl;
+
+        cout << left  << setw(nameWidth) << setfill(separator) << "# of invalid segments" << " | ";
+        cout << right << setw(numWidth) << setfill(separator) << srcInvalidSegments.size() << " | ";
+        cout << right << setw(numWidth) << setfill(separator) << tgtInvalidSegments.size() << endl;
     }
 
-    cout << left  << setw(nameWidth) << setfill(separator) << "# of subcluster" << " | ";
-    cout << right << setw(numWidth) << setfill(separator) << srcInvalidSegments.size() << " | ";
-    cout << right << setw(numWidth) << setfill(separator) << tgtInvalidSegments.size() << endl;
-
-    cout << dashedLine << endl;
-    cout << left  << setw(nameWidth) << setfill(separator) << "# of segments (Input)" << " | ";
-    cout << right << setw(numWidth) << setfill(separator) << srcValidSegments->points.size() << " | ";
-    cout << right << setw(numWidth) << setfill(separator) << tgtValidSegments->points.size() << endl;
-    cout << dashedLine << endl;
     /* --------------------------------------------------------------------- */
 
     /***
@@ -206,8 +237,19 @@ int main(int argc, char **argv) {
     pcl::PointCloud<PointType>::Ptr srcFeat(new pcl::PointCloud<PointType>);
     pcl::PointCloud<PointType>::Ptr tgtFeat(new pcl::PointCloud<PointType>);
 
-    voxelize(ptrSrcNonground, srcFeat, voxel_size);
-    voxelize(ptrTgtNonground, tgtFeat, voxel_size);
+    // if(groundSegMode == "Patchwork" || groundSegMode == "LeGO-LOAM") {
+    //     voxelize(srcValidSegments, srcFeat, voxel_size);
+    //     voxelize(tgtValidSegments, tgtFeat, voxel_size);
+    // } else {
+    //     voxelize(ptrSrcNonground, srcFeat, voxel_size);
+    //     voxelize(ptrTgtNonground, tgtFeat, voxel_size);
+    // }
+
+
+    *srcFeat = *srcRaw;
+    *tgtFeat = *tgtRaw;
+
+    std::chrono::system_clock::time_point after_voxelize = std::chrono::system_clock::now();
 
     FPFHManager fpfhmanager(normal_radius, fpfh_radius);
     fpfhmanager.flushAllFeatures();
@@ -249,8 +291,14 @@ int main(int argc, char **argv) {
     quatro.computeTransformation(output);
 
     std::chrono::duration<double> sec = std::chrono::system_clock::now() - start;
+    std::chrono::duration<double> ground_sec = after_ground - start;
+    std::chrono::duration<double> voxelize_sec = after_voxelize - after_ground;
+    std::chrono::duration<double> phfh_sec = before_optim - after_voxelize;
     std::chrono::duration<double> optim_sec = std::chrono::system_clock::now() - before_optim;
     std::cout << setprecision(4) << "\033[1;32mTotal takes: " << sec.count() << " sec. ";
+    std::cout << "(Ground segmentation: " << ground_sec.count() << " sec.) ";
+    std::cout << "(Voxelization: " << voxelize_sec.count() << " sec.) ";
+    std::cout << "(FPFH: " << phfh_sec.count() << " sec.) ";
     std::cout << "(Setting matching pairs: " << sec.count() - optim_sec.count() << " sec. + Quatro: " << optim_sec.count() << " sec.)\033[0m" << std::endl;
 
     /**

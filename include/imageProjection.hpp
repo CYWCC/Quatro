@@ -25,7 +25,7 @@ private:
     cv::Mat groundMat; // ground matrix for ground cloud marking
 
     int labelCount;
-    int numMinPtsForSubclustering = 30;
+    int numMinPtsForSubclustering = 30; // < this value, it is considered as outliers
 
     float startOrientation;
     float endOrientation;
@@ -57,7 +57,7 @@ public:
 
     const float sensorMountAngle = 0.0;
     //segmentation threshold
-    const float segmentTheta = 60.0/180.0*M_PI; // decrese this value may improve accuracy
+    const float segmentTheta =40.0/180.0*M_PI; // decrese this value may improve accuracy
     //If number of segment is below than 30, check line number. this for minimum number of point for it
     const int   segmentValidPointNum = 5;
     //if number of segment is small, number of line is checked, this is threshold for it.

@@ -52,6 +52,10 @@ include_directories(
         include
 )
 
+# 添加CSF库的包含目录
+include_directories(/usr/local/include/CSF)
+link_directories(/usr/local/lib)
+
 include(3rdparty/find_dependencies.cmake)
 
 file(DOWNLOAD https://urserver.kaist.ac.kr/publicdata/quatro/000540.bin ${CMAKE_CURRENT_LIST_DIR}/materials/000540.bin)
@@ -71,7 +75,10 @@ set(teaser_src
         src/teaser_utils/fpfh.cc
         )
 
-add_executable(run_example examples/run_global_registration.cpp ${teaser_src})
+add_executable(run_example 
+                examples/run_global_registration.cpp 
+                ${teaser_src}
+                src/CSF_filter.cpp)
 
 target_link_libraries(run_example
         PUBLIC
@@ -79,4 +86,5 @@ target_link_libraries(run_example
         ${catkin_LIBRARIES}
         stdc++fs
         pmc::pmc
+        CSF # 添加CSF库
         )
